@@ -20,7 +20,7 @@ Everything in this repo is **file-mount patches** on top of that image. You neve
 ## Model
 
 Any AWQ-INT4 checkpoint works with the kernel patches; the tested one is
-[`tclf90/Qwen3.5-4B-AWQ`](https://huggingface.co/tclf90/Qwen3.5-4B-AWQ) (~6 GB).
+[`QuantTrio/Qwen3.5-4B-AWQ`](https://huggingface.co/QuantTrio/Qwen3.5-4B-AWQ) (~6 GB).
 
 ---
 
