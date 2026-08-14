@@ -1,0 +1,49 @@
+# gfx1030 working override (v2)
+#  - ROCM_ATTN (TRITON_ATTN exceeds the per-workgroup LDS cap on gfx1030)
+#  - TP=1 + small footprint (keeps KV cache positive)
+#  - NO --enforce-eager: testing breakable CUDA graphs (graph capture without
+#    torch.compile, avoiding the gfx1030/inductor system-freeze risk)
+#  - host mounts: patched awq_triton (SPLIT_K=1 decode) + persistent Triton
+#    cache, so both survive container recreates
+services:
+  vllm:
+    environment:
+      # CUDA graphs without torch.compile (experimental; safer on gfx1030)
+      - VLLM_USE_BREAKABLE_CUDAGRAPH=1
+    volumes:
+      # persistent gfx1030 kernel patches (survive container recreate)
+      - /home/beefyboi1/qwen/gfx1030-patches/awq_triton.py:/src/vllm/vllm/model_executor/layers/quantization/awq_triton.py:ro
+      - /home/beefyboi1/qwen/gfx1030-patches/utils.py:/src/vllm/vllm/model_executor/layers/utils.py:ro
+      # persistent Triton JIT cache -> fast restarts, survives recreate
+      - /home/beefyboi1/qwen/gfx1030-patches/.triton:/root/.triton
+    command:
+      - serve
+      - /model
+      - --quantization
+      - awq
+      - --tensor-parallel-size
+      - "1"
+      - --max-model-len
+      - "8192"
+      - --max-num-seqs
+      - "2"
+      - --max-num-batched-tokens
+      - "2048"
+      - --trust-remote-code
+      - --dtype
+      - float16
+      - --attention-backend
+      - ROCM_ATTN
+      - --gpu-memory-utilization
+      - "0.90"
+      - --generation-config
+      - vllm
+      - --enable-chunked-prefill
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --limit-mm-per-prompt
+      - '{"image": 1}'
+      - --mm-processor-kwargs
+      - '{"max_pixels": 1003520}'

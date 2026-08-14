@@ -1,0 +1,66 @@
+services:
+  vllm:
+    image: blivioniag/vllm-rdna:v0.26.0
+    container_name: qwen-vllm
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - /home/beefyboi1/qwen/Qwen3.5-4B-AWQ:/model:ro
+    shm_size: "4g"
+    environment:
+      # --- RDNA2/gfx1030 Specific Optimizations ---
+      - HSA_OVERRIDE_GFX_VERSION=10.3.0
+      - HIP_FORCE_DEV_KERNARG=1
+      - TORCH_BLAS_PREFER_HIPBLASLT=0
+      - OMP_NUM_THREADS=8
+      - TOKENIZERS_PARALLELISM=false
+      - FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
+      - VLLM_USE_TRITON_AWQ=1
+      - VLLM_USE_DEEP_GEMM=0
+      - VLLM_USE_FLASHINFER_SAMPLER=0
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    devices:
+      - /dev/dri
+      - /dev/kfd
+    group_add:
+      - "render"
+      - "video"
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined
+    privileged: false
+    command:
+      - serve
+      - /model
+      - --quantization
+      - awq
+      - --tensor-parallel-size
+      - "2"
+      - --max-model-len
+      - "32768"
+      - --max-num-seqs
+      - "8"
+      - --max-num-batched-tokens
+      - "8192"
+      - --trust-remote-code
+      - --dtype
+      - float16
+      - --attention-backend
+      - TRITON_ATTN
+      - --gpu-memory-utilization
+      - "0.92"
+      - --generation-config
+      - vllm
+      - --enforce-eager
+      - --enable-chunked-prefill
+      - --enable-prefix-caching
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --limit-mm-per-prompt
+      - '{"image": 1}'
+      - --mm-processor-kwargs
+      - '{"max_pixels": 4014080}'

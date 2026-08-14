@@ -1,0 +1,200 @@
+--- a/vllm/model_executor/layers/quantization/awq_triton.py
++++ b/vllm/model_executor/layers/quantization/awq_triton.py
+@@ -88,7 +88,7 @@
+     # Compute scale offsets and masks.
+     scale_offsets_y = pid_y * BLOCK_SIZE_Y // group_size + tl.arange(0, 1)
+     scale_offsets_x = pid_x * BLOCK_SIZE_X * 8 + tl.arange(0, BLOCK_SIZE_X * 8)
+-    scale_offsets = num_cols * 8 * scale_offsets_y[:, None] + scale_offsets_x[None, :]
++    scale_offsets = 8 * num_cols * scale_offsets_y[:, None] + scale_offsets_x[None, :]
+     scale_masks_y = scale_offsets_y < num_rows // group_size
+     scale_masks_x = scale_offsets_x < num_cols * 8
+     scale_masks = scale_masks_y[:, None] & scale_masks_x[None, :]
+@@ -227,6 +227,85 @@
+     tl.store(c_ptrs, c, mask=c_mask)
+ 
+ 
++@triton.jit
++def awq_gemv_kernel(
++    x_ptr,
++    qweight_ptr,
++    out_ptr,
++    zeros_ptr,
++    scales_ptr,
++    K,
++    N,
++    group_size,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++):
++    # [gfx1030/RDNA2] Single-token (M==1) GEMV: no tl.dot, so no wasted M-tile.
++    # Each program owns BLOCK_N output columns and streams the packed int4
++    # weights for BLOCK_K rows per iteration (must lie within one quant group:
++    # caller guarantees group_size % BLOCK_K == 0).
++    pid = tl.program_id(0)
++
++    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
++    masks_n = offs_n < N
++    offs_n8 = pid * (BLOCK_N // 8) + tl.arange(0, BLOCK_N // 8)
++    masks_n8 = offs_n8 < N // 8
++
++    reverse_awq_order_tensor = (
++        (tl.arange(0, 2) * 4)[None, :] + tl.arange(0, 4)[:, None]
++    ).reshape(8)
++    shifts = reverse_awq_order_tensor * 4
++    shifts = tl.broadcast_to(shifts[None, :], (BLOCK_K * (BLOCK_N // 8), 8))
++    shifts = tl.reshape(shifts, (BLOCK_K, BLOCK_N))
++
++    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
++
++    for k0 in range(0, tl.cdiv(K, BLOCK_K)):
++        offs_k = k0 * BLOCK_K + tl.arange(0, BLOCK_K)
++        masks_k = offs_k < K
++
++        x = tl.load(x_ptr + offs_k, mask=masks_k, other=0.0)
++
++        offs_b = (N // 8) * offs_k[:, None] + offs_n8[None, :]
++        b = tl.load(
++            qweight_ptr + offs_b,
++            mask=masks_k[:, None] & masks_n8[None, :],
++            other=0.0,
++        )
++        b = tl.interleave(b, b)
++        b = tl.interleave(b, b)
++        b = tl.interleave(b, b)
++
++        g_row = k0 * BLOCK_K // group_size + tl.arange(0, 1)
++        offs_z = (N // 8) * g_row[:, None] + offs_n8[None, :]
++        zeros = tl.load(
++            zeros_ptr + offs_z,
++            mask=(g_row[:, None] < K // group_size) & masks_n8[None, :],
++            other=0.0,
++        )
++        zeros = tl.interleave(zeros, zeros)
++        zeros = tl.interleave(zeros, zeros)
++        zeros = tl.interleave(zeros, zeros)
++        zeros = tl.broadcast_to(zeros, (BLOCK_K, BLOCK_N))
++
++        offs_s = N * g_row[:, None] + offs_n[None, :]
++        scales = tl.load(
++            scales_ptr + offs_s,
++            mask=(g_row[:, None] < K // group_size) & masks_n[None, :],
++            other=0.0,
++        )
++        scales = tl.broadcast_to(scales, (BLOCK_K, BLOCK_N))
++
++        b = (b >> shifts) & 0xF
++        zeros = (zeros >> shifts) & 0xF
++        w = (b - zeros) * scales
++
++        acc += tl.sum(w.to(tl.float32) * x.to(tl.float32)[:, None], axis=0)
++
++    out = acc.to(out_ptr.type.element_ty)
++    tl.store(out_ptr + offs_n, out, mask=masks_n)
++
++
+ # qweights - [K     , M // 8], int32
+ # scales   - [K // G, M     ], float16
+ # zeros    - [K // G, M // 8], int32
+@@ -279,6 +358,39 @@
+     return result
+ 
+ 
++# [gfx1030] single-token GEMV wrapper: input [1, K], qweight [K, N//8],
++# scales [K//G, N], qzeros [K//G, N//8]. BLOCK_K must divide group_size.
++def awq_gemv_triton(
++    input: torch.Tensor,
++    qweight: torch.Tensor,
++    scales: torch.Tensor,
++    qzeros: torch.Tensor,
++    block_n: int = 128,
++    block_k: int = 64,
++) -> torch.Tensor:
++    M, K = input.shape
++    N = qweight.shape[1] * 8
++    group_size = qweight.shape[0] // qzeros.shape[0]
++    assert group_size % block_k == 0
++    result = torch.empty((M, N), dtype=scales.dtype, device=input.device)
++    grid = (triton.cdiv(N, block_n),)
++    awq_gemv_kernel[grid](
++        input,
++        qweight,
++        result,
++        qzeros,
++        scales,
++        K,
++        N,
++        group_size,
++        BLOCK_N=block_n,
++        BLOCK_K=block_k,
++        num_warps=4,
++        num_stages=3,
++    )
++    return result
++
++
+ # input   - [M, K]
+ # qweight - [K, N // 8]
+ # qzeros  - [K // G, N // 8]
+@@ -298,6 +410,24 @@
+     N = qweight.shape[1] * 8
+     group_size = qweight.shape[0] // qzeros.shape[0]
+ 
++    # [gfx1030/RDNA2 decode tuning] For skinny matmuls (small M == decode), use
++    # the swept-best tiles BM=16/BN=128/BK=64/W=8/S=3 and pick SPLIT_K by K:
++    # short K (<=4096): SK=1 (no partial/reduction overhead; SK=2 tied in sweep)
++    # long  K (> 4096): SK=8 (K-split occupancy; 103us vs 220us on m=2560,k=9216)
++    num_warps, num_stages = 4, 3
++    if M == 1:
++        # [gfx1030] dedicated GEMV path (no tl.dot M-tile waste). Swept:
++        # 58.4us vs 92.8us (dot) on m=9216,k=2560; 94.2us vs 103.1us on
++        # m=2560,k=9216. BN by N: large N -> 128/64; small N -> 32/128 for
++        # enough programs.
++        block_n = 128 if N >= 4096 else 32
++        block_k = 64 if block_n == 128 else 128
++        return awq_gemv_triton(input, qweight, scales, qzeros, block_n, block_k)
++    if M <= 32:
++        block_size_m, block_size_n, block_size_k = 16, 128, 64
++        num_warps, num_stages = 8, 3
++        split_k_iters = 1 if K <= 4096 else 8
++
+     assert N > 0 and K > 0 and M > 0
+     assert qweight.shape[0] == K and qweight.shape[1] == N // 8
+     assert qzeros.shape[0] == K // group_size and qzeros.shape[1] == N // 8
+@@ -312,6 +442,28 @@
+         split_k_iters,
+     )
+ 
++    if split_k_iters == 1:
++        # No K-split: write directly into a single (M, N) output; no reduction.
++        result = torch.empty((M, N), dtype=scales.dtype, device=input.device)
++        awq_gemm_kernel[grid](
++            input,
++            qweight,
++            result,
++            qzeros,
++            scales,
++            M,
++            N,
++            K,
++            group_size,
++            BLOCK_SIZE_M=block_size_m,
++            BLOCK_SIZE_N=block_size_n,
++            BLOCK_SIZE_K=block_size_k,
++            SPLIT_K=split_k_iters,
++            num_warps=num_warps,
++            num_stages=num_stages,
++        )
++        return result
++
+     result = torch.zeros((split_k_iters, M, N), dtype=scales.dtype, device=input.device)
+ 
+     # A = input, B = qweight, C = result
+@@ -330,6 +482,8 @@
+         BLOCK_SIZE_N=block_size_n,
+         BLOCK_SIZE_K=block_size_k,
+         SPLIT_K=split_k_iters,
++        num_warps=num_warps,
++        num_stages=num_stages,
+     )
+ 
+     result = result.sum(0)
