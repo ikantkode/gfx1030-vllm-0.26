@@ -494,6 +494,29 @@ def awq_gemv_splitk_reduce(
 
 # [gfx1030] K-split GEMV wrapper. Requires K % split == 0 and
 # (K // split) % block_k == 0 (block_k must still divide group_size).
+#
+# [gfx1030 rung 11] Persistent partials scratch. Per-call torch.empty for the
+# (split, N) fp32 buffer costs ~200 allocs/token in eager segments; a cache
+# keyed by (N, split, device) allocates once and reuses. Graph-safe: the
+# buffer is allocated on first forward (eager warmup or first capture pass)
+# and its address is then as stable as a weight tensor's — captured kernels
+# keep pointing at it. Same-stream sequential decode guarantees the previous
+# call's reduce consumed the partials before the next gemv overwrites them.
+# NOTE: only the INTERNAL partials are cached. `result` must stay per-call —
+# gate/up share an (N, K) key, so a cached output would clobber gate's result
+# before silu_and_mul reads both. Total cache size here: ~1.8 MB (6 shapes).
+_SPLITK_PARTIALS: dict = {}
+
+
+def _splitk_partials(N: int, split: int, device: torch.device) -> torch.Tensor:
+    key = (N, split, device.index)
+    buf = _SPLITK_PARTIALS.get(key)
+    if buf is None:
+        buf = torch.empty((split, N), dtype=torch.float32, device=device)
+        _SPLITK_PARTIALS[key] = buf
+    return buf
+
+
 def awq_gemv_splitk_triton(
     input: torch.Tensor,
     qweight: torch.Tensor,
@@ -510,7 +533,7 @@ def awq_gemv_splitk_triton(
     group_size = qweight.shape[0] // qzeros.shape[0]
     assert group_size % block_k == 0
     assert K % split == 0 and (K // split) % block_k == 0
-    partials = torch.empty((split, N), dtype=torch.float32, device=input.device)
+    partials = _splitk_partials(N, split, input.device)
     grid = (triton.cdiv(N, block_n), split)
     awq_gemv_splitk_kernel[grid](
         input,

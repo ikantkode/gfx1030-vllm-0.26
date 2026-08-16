@@ -49,6 +49,7 @@ Any AWQ-INT4 checkpoint works with the kernel patches; the tested one is
 | 8 | **Re-quant `self_attn` + `linear_attn` to INT4** (`requant/`; fp16 weight read 2.53 → 0.65 GB/token) | **51.7** |
 | 9 | `awq_triton.py`: -vd shape-set GEMV tile re-sweep (135-config grid, L2-flushed; per-(N,K) dispatch table) | 53.7 |
 | 10 | `awq_triton.py`: **K-split GEMV for M==1** (`awq_gemv_splitk_kernel` grid (N/BN, 16) + fp32 partials + reduce; INT4 block 13.3 → 9.1 ms/token cold) | **62.3** |
+| 11 | `awq_triton.py`: persistent splitk partials cache (`_SPLITK_PARTIALS`, keyed (N, split, device); graph-safe) | 62.3 (neutral, kept) |
 
 **Decode budget (~16.1 ms/token at 62.3 TPS).** Cold-VRAM kernel math (GPU-1 harness,
 L2-flushed, median-60): INT4 GEMV block 9.1 ms/token (was 13.3 after rung 9's re-sweep; the
