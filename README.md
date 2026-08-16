@@ -1,6 +1,6 @@
 # gfx1030-vllm-0.26 — vLLM 0.26 optimized for AMD RDNA2 (gfx1030 / Radeon PRO V620)
 
-Surgical kernel patches that take **single-stream LLM decode from ~10 to 51.7 tokens/s (5.2×)** on
+Surgical kernel patches that take **single-stream LLM decode from ~10 to 62.3 tokens/s (6.2×)** on
 unsupported AMD gfx1030 hardware — no vLLM rebuild, no Triton fork, all mounted as files into a
 prebuilt docker image.
 
@@ -47,15 +47,18 @@ Any AWQ-INT4 checkpoint works with the kernel patches; the tested one is
 | 6 | `awq_triton.py`: **custom GEMV kernel for M==1** (no `tl.dot` M-tile waste) | 44.0 |
 | 7 | `utils.py`: Triton fp16 GEMV for n==1, k>8192 (LLMM1 can't launch there; was ~700 µs rocBLAS) | 45.2 |
 | 8 | **Re-quant `self_attn` + `linear_attn` to INT4** (`requant/`; fp16 weight read 2.53 → 0.65 GB/token) | **51.7** |
+| 9 | `awq_triton.py`: -vd shape-set GEMV tile re-sweep (135-config grid, L2-flushed; per-(N,K) dispatch table) | 53.7 |
+| 10 | `awq_triton.py`: **K-split GEMV for M==1** (`awq_gemv_splitk_kernel` grid (N/BN, 16) + fp32 partials + reduce; INT4 block 13.3 → 9.1 ms/token cold) | **62.3** |
 
-**Decode budget (~19.3 ms/token at 51.7 TPS).** At rung 7 a real torch.profiler capture gave
-(~22.2 ms/token): LLMM1 fp16 GEMVs 9.4 · AWQ INT4 GEMV 6.1 · elementwise/casts/copies 4.2 ·
-attention 0.8 · FLA 0.3 · fp16 k>8192 GEMV 0.1. Rung 8 removes ~7 ms of the fp16 GEMV block
-(2.53 → 0.65 GB/token at the same bandwidth); the residual rows are inherited from that capture,
-not re-profiled.
+**Decode budget (~16.1 ms/token at 62.3 TPS).** Cold-VRAM kernel math (GPU-1 harness,
+L2-flushed, median-60): INT4 GEMV block 9.1 ms/token (was 13.3 after rung 9's re-sweep; the
+other rows are still inherited from the rung-7 enforce-eager capture — a fresh graphs-on
+capture is the next planned step). Live recovered ~2.6 of rung 10's 4.2 cold ms; the residual
+gap is split between split-K contention/occupancy and the stale elementwise estimate.
 
 Physics ceiling after rung 8 ≈ **113–145 TPS** (weight read 5.4 → ~3.5 GB/token at ~445 GB/s
-effective; was 74–95 before the attention re-quant).
+effective; was 74–95 before the attention re-quant). Byte-exact floor from checkpoint ground
+truth: 3.12 GB/token (INT4 1.85 + tied fp16 lm_head 1.27) → ~142 TPS hard ceiling.
 
 ## Roadmap
 
@@ -111,7 +114,7 @@ curl -s http://localhost:8000/v1/completions -H 'Content-Type: application/json'
 # measured run
 time curl -s http://localhost:8000/v1/completions -H 'Content-Type: application/json' \
   -d '{"model":"/model","prompt":"Write a long detailed essay about the history of computing.","max_tokens":256,"temperature":0,"ignore_eos":true}'
-# TPS = completion_tokens / wall_seconds  (expect ~45 on a V620)
+# TPS = completion_tokens / wall_seconds  (expect ~62 on a V620)
 ```
 
 ### 5. Applying the patches to a different image/version

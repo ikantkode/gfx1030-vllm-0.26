@@ -367,6 +367,8 @@ def awq_gemv_triton(
     qzeros: torch.Tensor,
     block_n: int = 128,
     block_k: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 3,
 ) -> torch.Tensor:
     M, K = input.shape
     N = qweight.shape[1] * 8
@@ -385,8 +387,154 @@ def awq_gemv_triton(
         group_size,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return result
+
+
+# [gfx1030] K-split GEMV for latency-bound small-N shapes. Rung-9 sweep fact:
+# N<=4096 shapes run at 8-27% of peak BW because cdiv(N, BN) programs cannot
+# fill ~80 CUs. Splitting K along axis 1 of the grid multiplies program count;
+# each program reduces its K-slice into an fp32 partial row, and a tiny second
+# kernel sums the SPLIT partials into the fp16 output.
+@triton.jit
+def awq_gemv_splitk_kernel(
+    x_ptr,
+    qweight_ptr,
+    partials_ptr,
+    zeros_ptr,
+    scales_ptr,
+    K,
+    N,
+    group_size,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    masks_n = offs_n < N
+    offs_n8 = pid_n * (BLOCK_N // 8) + tl.arange(0, BLOCK_N // 8)
+    masks_n8 = offs_n8 < N // 8
+
+    # reverse AWQ order [0,4,1,5,2,6,3,7] -> nibble shifts
+    reverse_awq_order_tensor = (
+        (tl.arange(0, 2) * 4)[None, :] + tl.arange(0, 4)[:, None]
+    ).reshape(8)
+    shifts = reverse_awq_order_tensor * 4
+    shifts = tl.broadcast_to(shifts[None, :], (BLOCK_K * (BLOCK_N // 8), 8))
+    shifts = tl.reshape(shifts, (BLOCK_K, BLOCK_N))
+
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    # caller guarantees K % SPLIT == 0 and (K // SPLIT) % BLOCK_K == 0, so
+    # every chunk stays K-tail-free and within one quant group (BLOCK_K | 128).
+    k_per = K // SPLIT
+    k_lo = pid_k * k_per
+    for k0 in range(k_lo, k_lo + k_per, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        x = tl.load(x_ptr + offs_k)
+
+        offs_b = (N // 8) * offs_k[:, None] + offs_n8[None, :]
+        b = tl.load(qweight_ptr + offs_b, mask=masks_n8[None, :], other=0.0)
+        b = tl.interleave(b, b)
+        b = tl.interleave(b, b)
+        b = tl.interleave(b, b)
+
+        g_row = k0 // group_size + tl.arange(0, 1)
+        offs_z = (N // 8) * g_row[:, None] + offs_n8[None, :]
+        zeros = tl.load(
+            zeros_ptr + offs_z,
+            mask=(g_row[:, None] < K // group_size) & masks_n8[None, :],
+            other=0.0,
+        )
+        zeros = tl.interleave(zeros, zeros)
+        zeros = tl.interleave(zeros, zeros)
+        zeros = tl.interleave(zeros, zeros)
+        zeros = tl.broadcast_to(zeros, (BLOCK_K, BLOCK_N))
+
+        offs_s = N * g_row[:, None] + offs_n[None, :]
+        scales = tl.load(
+            scales_ptr + offs_s,
+            mask=(g_row[:, None] < K // group_size) & masks_n[None, :],
+            other=0.0,
+        )
+        scales = tl.broadcast_to(scales, (BLOCK_K, BLOCK_N))
+
+        b = (b >> shifts) & 0xF
+        zeros = (zeros >> shifts) & 0xF
+        w = (b - zeros) * scales  # fp16
+
+        acc += tl.sum(
+            w.to(tl.float32) * x.to(tl.float32)[:, None], axis=0
+        )
+
+    tl.store(partials_ptr + pid_k * N + offs_n, acc, mask=masks_n)
+
+
+@triton.jit
+def awq_gemv_splitk_reduce(
+    partials_ptr,
+    out_ptr,
+    N,
+    SPLIT: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    masks = offs < N
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for s in range(SPLIT):
+        acc += tl.load(partials_ptr + s * N + offs, mask=masks, other=0.0)
+    tl.store(out_ptr + offs, acc.to(out_ptr.type.element_ty), mask=masks)
+
+
+# [gfx1030] K-split GEMV wrapper. Requires K % split == 0 and
+# (K // split) % block_k == 0 (block_k must still divide group_size).
+def awq_gemv_splitk_triton(
+    input: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    block_n: int = 16,
+    block_k: int = 128,
+    split: int = 8,
+    num_warps: int = 8,
+    num_stages: int = 3,
+) -> torch.Tensor:
+    M, K = input.shape
+    N = qweight.shape[1] * 8
+    group_size = qweight.shape[0] // qzeros.shape[0]
+    assert group_size % block_k == 0
+    assert K % split == 0 and (K // split) % block_k == 0
+    partials = torch.empty((split, N), dtype=torch.float32, device=input.device)
+    grid = (triton.cdiv(N, block_n), split)
+    awq_gemv_splitk_kernel[grid](
+        input,
+        qweight,
+        partials,
+        qzeros,
+        scales,
+        K,
+        N,
+        group_size,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        SPLIT=split,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    result = torch.empty((M, N), dtype=scales.dtype, device=input.device)
+    awq_gemv_splitk_reduce[(triton.cdiv(N, 256),)](
+        partials,
+        result,
+        N,
+        SPLIT=split,
+        BLOCK_N=256,
         num_warps=4,
-        num_stages=3,
     )
     return result
 
@@ -416,13 +564,54 @@ def awq_gemm_triton(
     # long  K (> 4096): SK=8 (K-split occupancy; 103us vs 220us on m=2560,k=9216)
     num_warps, num_stages = 4, 3
     if M == 1:
-        # [gfx1030] dedicated GEMV path (no tl.dot M-tile waste). Swept:
-        # 58.4us vs 92.8us (dot) on m=9216,k=2560; 94.2us vs 103.1us on
-        # m=2560,k=9216. BN by N: large N -> 128/64; small N -> 32/128 for
-        # enough programs.
-        block_n = 128 if N >= 4096 else 32
-        block_k = 64 if block_n == 128 else 128
-        return awq_gemv_triton(input, qweight, scales, qzeros, block_n, block_k)
+        # [gfx1030] Rung 10: K-split GEMV first. Rung 9 proved the small-N
+        # shapes latency-bound (8-27% of peak BW; cdiv(N,BN) programs can't
+        # fill ~80 CUs), so add a K-split grid axis + fp32 partials + tiny
+        # reduce. Full-sweep winner is ONE config for all six -vd shapes:
+        #   BN=64 BK=32 SP=16 W=2 S=3  (bench_awq5.py, GPU 1, L2-flushed
+        #   median-60, correctness-gated vs the rung-9 dispatch):
+        #   N=9216 K=2560 (x64): 66.3 -> 55.3us
+        #   N=8192 K=2560 (x32): 69.2 -> 54.2us
+        #   N=4096 K=2560 (x24): 55.2 -> 35.0us
+        #   N=2560 K=9216 (x32): 102.8 -> 51.8us
+        #   N=2560 K=4096 (x32): 52.4 -> 32.3us
+        #   N=1024 K=2560 (x16): 36.3 -> 18.7us
+        # INT4 GEMV block 13.33 -> 9.10 ms/token; projected ~69 TPS.
+        # Gate = the wrapper's asserts, checked here to stay assert-free.
+        if K % 16 == 0 and (K // 16) % 32 == 0 and group_size % 32 == 0:
+            return awq_gemv_splitk_triton(
+                input, qweight, scales, qzeros, 64, 32, 16, 2, 3,
+            )
+        # [gfx1030] dedicated GEMV path (no tl.dot M-tile waste). Rung 9:
+        # re-swept over the full -vd shape set (6 unique shapes, 135-config
+        # grid, L2-flushed cold timing, correctness-gated vs the dot kernel).
+        # Per-shape winners (old heuristic -> new, us):
+        #   N=9216 K=2560 (x64): 128/64/4/3 67.0 -> 128/128/4/3 66.2
+        #   N=8192 K=2560 (x32): 128/64/4/3 69.1 -> unchanged
+        #   N=4096 K=2560 (x24): 128/64/4/3 60.4 -> 128/128/4/3 55.4
+        #   N=2560 K=9216 (x32): 32/128/4/3 118.2 -> 16/128/8/3 103.0
+        #   N=2560 K=4096 (x32): 32/128/4/3 59.5 -> 16/128/8/3 52.4
+        #   N=1024 K=2560 (x16): 32/128/4/3 43.6 -> 16/128/8/3 36.1
+        # Rule: large N keeps BN=128/W4; small N wants BN=16 (more programs)
+        # + W8 (latency hiding). Superseded per-shape by splitk above; kept
+        # as the fallback for shapes failing the splitk divisibility gate.
+        gemv_cfg = {
+            (9216, 2560): (128, 128, 4, 3),
+            (8192, 2560): (128, 64, 4, 3),
+            (4096, 2560): (128, 128, 4, 3),
+            (2560, 9216): (16, 128, 8, 3),
+            (2560, 4096): (16, 128, 8, 3),
+            (1024, 2560): (16, 128, 8, 3),
+        }.get((N, K))
+        if gemv_cfg is None:
+            # unseen shape: old heuristic fallback (never worse than stock)
+            block_n = 128 if N >= 4096 else 32
+            block_k = 64 if block_n == 128 else 128
+            gemv_cfg = (block_n, block_k, 4, 3)
+        return awq_gemv_triton(
+            input, qweight, scales, qzeros,
+            gemv_cfg[0], gemv_cfg[1], gemv_cfg[2], gemv_cfg[3],
+        )
     if M <= 32:
         block_size_m, block_size_n, block_size_k = 16, 128, 64
         num_warps, num_stages = 8, 3
