@@ -7,6 +7,19 @@ Supervisor schedule(wait=2, warmup=2, active=5, repeat=1) intends "capture
 steady state, skip cold start"; offline LLM() has no per-engine-step hook to
 drive profiler.step(), so the equivalent is: unprofiled warmup generates,
 then full-window capture of the 256-token temp-0 decode.
+
+Invocation (each env var cost a failed attempt to discover):
+  docker exec -e HIP_VISIBLE_DEVICES=1 -e VLLM_USE_BREAKABLE_CUDAGRAPH=1 \
+       -e VLLM_ENABLE_V1_MULTIPROCESSING=0 quant-run python3 /qwork/prof_r12.py
+- HIP_VISIBLE_DEVICES (NOT CUDA_VISIBLE_DEVICES): CVD on ROCm spins forever
+  in the multimodal encoder-profiling path (~17 min at 103% CPU, idle GPU).
+- VLLM_ENABLE_V1_MULTIPROCESSING=0: V1 EngineCore otherwise runs the forward
+  in a child process and the parent's profiler captures nothing (29 us total).
+- torch renamed FunctionEventAvg.cuda_time_total -> device_time_total; the
+  CSV writer uses getattr fallback so it works on both.
+- kineto/ROCTracer adds ~60 us/launch CPU tax: wall in the trace is ~6.5x
+  live (103.5 vs 16.05 ms/token). Kernel DURATIONS are honest; gaps are not
+  (use analyze_r12b.py totals + live-wall subtraction instead).
 """
 import os
 os.environ.setdefault("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
@@ -55,7 +68,11 @@ def main():
         w.writerow(["name", "count", "cuda_total_us", "cpu_total_us"])
         for e in ka:
             if e.count:
-                w.writerow([e.key, e.count, e.cuda_time_total, e.cpu_time_total])
+                # torch renamed cuda_time_total -> device_time_total
+                gpu_us = getattr(e, "device_time_total", None)
+                if gpu_us is None:
+                    gpu_us = getattr(e, "cuda_time_total", 0)
+                w.writerow([e.key, e.count, gpu_us, e.cpu_time_total])
 
     prof.export_chrome_trace("/qwork/prof_r12_trace.json")
     print("TRACE_EXPORTED /qwork/prof_r12_trace.json", flush=True)
