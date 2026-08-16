@@ -1,10 +1,12 @@
 # gfx1030-vllm-0.26 — vLLM 0.26 optimized for AMD RDNA2 (gfx1030 / Radeon PRO V620)
 
-Surgical kernel patches that take **single-stream LLM decode from ~10 to 45.2 tokens/s (4.5×)** on
+Surgical kernel patches that take **single-stream LLM decode from ~10 to 51.7 tokens/s (5.2×)** on
 unsupported AMD gfx1030 hardware — no vLLM rebuild, no Triton fork, all mounted as files into a
 prebuilt docker image.
 
-Tested with: `Qwen3.5-4B-AWQ` (hybrid GDN linear-attention + full-attention multimodal model, AWQ-INT4 MLP),
+Tested with: `Qwen3.5-4B-AWQ-vd` (hybrid GDN linear-attention + full-attention multimodal model,
+AWQ-INT4 MLP + attention — our re-quant of `Qwen/Qwen3.5-4B`, see `requant/`; distinct from
+`QuantTrio/Qwen3.5-4B-AWQ` used at rungs 0–7),
 2× AMD Radeon PRO V620 (gfx1030, RDNA2, 32 GB), ROCm 7.2 host driver, Ubuntu 24.04.
 
 ---
@@ -43,28 +45,31 @@ Any AWQ-INT4 checkpoint works with the kernel patches; the tested one is
 | 4 | `awq_triton.py`: swept tiles `16/128/64/W8/S3` | 34.5 |
 | 5 | `awq_triton.py`: shape-aware `SPLIT_K` (K≤4096→1, K>4096→8) | 38.9 |
 | 6 | `awq_triton.py`: **custom GEMV kernel for M==1** (no `tl.dot` M-tile waste) | 44.0 |
-| 7 | `utils.py`: Triton fp16 GEMV for n==1, k>8192 (LLMM1 can't launch there; was ~700 µs rocBLAS) | **45.2** |
+| 7 | `utils.py`: Triton fp16 GEMV for n==1, k>8192 (LLMM1 can't launch there; was ~700 µs rocBLAS) | 45.2 |
+| 8 | **Re-quant `self_attn` + `linear_attn` to INT4** (`requant/`; fp16 weight read 2.53 → 0.65 GB/token) | **51.7** |
 
-**Decode budget today (~22 ms/token at 45.2 TPS), from a real torch.profiler capture:**
+**Decode budget (~19.3 ms/token at 51.7 TPS).** At rung 7 a real torch.profiler capture gave
+(~22.2 ms/token): LLMM1 fp16 GEMVs 9.4 · AWQ INT4 GEMV 6.1 · elementwise/casts/copies 4.2 ·
+attention 0.8 · FLA 0.3 · fp16 k>8192 GEMV 0.1. Rung 8 removes ~7 ms of the fp16 GEMV block
+(2.53 → 0.65 GB/token at the same bandwidth); the residual rows are inherited from that capture,
+not re-profiled.
 
-| Component | ms/token | Status |
-|---|---|---|
-| LLMM1 fp16 GEMVs (the 4.26 GB FP16 weight read) | 9.4 | at bandwidth — only re-quantization fixes this |
-| AWQ INT4 GEMV (custom kernel) | 6.1 | ~2× above floor |
-| elementwise / dtype-casts / copies (~1,700 tiny ops/token) | 4.2 | unfused (needs torch.compile-class machinery; freeze-risk on gfx1030) |
-| paged attention (ROCM_ATTN) | 0.8 | fine |
-| FLA/GDN recurrent decode | 0.3 | optimal (swept; stock config already best) |
-| fp16 GEMV k>8192 | ~0.1 | fixed (was 0.7) |
-
-Physics ceiling for this model ≈ 74–95 TPS (5.4 GB/token weight read at ~445 GB/s effective).
+Physics ceiling after rung 8 ≈ **113–145 TPS** (weight read 5.4 → ~3.5 GB/token at ~445 GB/s
+effective; was 74–95 before the attention re-quant).
 
 ## Roadmap
 
-1. **Re-quantize `self_attn` + `linear_attn` to INT4** (in progress — see `requant/`): cuts the FP16
-   read 2.53 → 0.65 GB/token, ceiling → 113–145 TPS, realistic served **~55–65 TPS**. Uses the
+1. ~~**Re-quantize `self_attn` + `linear_attn` to INT4**~~ — **DONE, rung 8, 51.7 TPS** (see
+   `requant/`). Cuts the FP16 read 2.53 → 0.65 GB/token; ceiling → 113–145 TPS. Uses the
    [`quivent/autoawq-qwen35`](https://github.com/quivent/autoawq-qwen35) AutoAWQ fork; the patched
    GEMV kernel automatically serves every newly-quantized layer. lm_head is **not** quantizable
    (tied embeddings — vLLM never creates a quantizable lm_head module).
+   **Gotcha that cost a day:** the fork's activation-smoothing writes input-LN folds Llama-style
+   (`w = s·w_base`), but Qwen3.5's RMSNorm applies gain `(1 + w)` — the delivered scale becomes
+   `(1+s·w)` instead of `s·(1+w)` and generation is garbage at serve time while every per-module
+   check looks clean. `requant/quant.py` post-passes fix the storage to `w = s·(1+w_base) − 1`
+   (per-channel s recovered by least squares from the folded consumers). If you re-quant with the
+   raw fork and output is gibberish, this is why.
 2. **Elementwise/cast storm** (~4.2 ms/token): spread across 378 casts + 430 copies per token; no
    single cut. Needs fusion machinery; torch.compile/inductor can freeze gfx1030 (ROCm #5572), so
    this is parked unless a safe path appears.
@@ -159,5 +164,6 @@ patches/    awq_triton.py(.orig/.patch), utils.py(.orig/.patch)
 compose/    docker-compose.yml + override (the working serving config)
 benches/    live kernel sweep harnesses (AWQ gemv/dot, fp16 gemv, FLA)
 profiling/  offline decode-attribution scripts
-requant/    WIP: self_attn+linear_attn INT4 re-quantization (AutoAWQ + autoawq-qwen35 fork)
+requant/    self_attn+linear_attn INT4 re-quantization pipeline (AutoAWQ + autoawq-qwen35 fork;
+            produces Qwen3.5-4B-AWQ-vd from Qwen/Qwen3.5-4B, incl. the (1+w) LN-fold post-pass)
 ```
