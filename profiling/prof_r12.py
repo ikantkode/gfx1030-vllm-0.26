@@ -12,47 +12,54 @@ import os
 os.environ.setdefault("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
 
 import torch
-print("DEVICE:", torch.cuda.device_count(), torch.cuda.get_device_name(0), flush=True)
 
-from vllm import LLM, SamplingParams
 
-llm = LLM(
-    model="/hostq/Qwen3.5-4B-AWQ-vd", quantization="awq", dtype="float16",
-    max_model_len=8192, max_num_seqs=2, max_num_batched_tokens=2048,
-    enable_chunked_prefill=True, gpu_memory_utilization=0.9,
-    attention_backend="ROCM_ATTN", trust_remote_code=True, generation_config="vllm",
-    limit_mm_per_prompt={"image": 1},
-    mm_processor_kwargs={"max_pixels": 1003520},
-)
-# warmup: graphs are captured at init; this warms sampler + python paths
-llm.generate(["hello"], SamplingParams(max_tokens=4, temperature=0), use_tqdm=False)
-llm.generate(["Write a long detailed essay about the history of computing."],
-             SamplingParams(max_tokens=64, temperature=0, ignore_eos=True), use_tqdm=False)
-print(">>> WARMUP DONE, starting profiled 256-token decode", flush=True)
+def main():
+    print("DEVICE:", torch.cuda.device_count(), torch.cuda.get_device_name(0), flush=True)
 
-from torch.profiler import ProfilerActivity
+    from vllm import LLM, SamplingParams
 
-with torch.profiler.profile(
-    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-    record_shapes=False, profile_memory=False, with_stack=False,
-) as prof:
-    out = llm.generate(
-        ["Write a long detailed essay about the history of computing."],
-        SamplingParams(max_tokens=256, temperature=0, ignore_eos=True),
-        use_tqdm=False,
+    llm = LLM(
+        model="/hostq/Qwen3.5-4B-AWQ-vd", quantization="awq", dtype="float16",
+        max_model_len=8192, max_num_seqs=2, max_num_batched_tokens=2048,
+        enable_chunked_prefill=True, gpu_memory_utilization=0.9,
+        attention_backend="ROCM_ATTN", trust_remote_code=True, generation_config="vllm",
+        limit_mm_per_prompt={"image": 1},
+        mm_processor_kwargs={"max_pixels": 1003520},
     )
-print("SAMPLE:", repr(out[0].outputs[0].text[:120]), flush=True)
+    # warmup: graphs are captured at init; this warms sampler + python paths
+    llm.generate(["hello"], SamplingParams(max_tokens=4, temperature=0), use_tqdm=False)
+    llm.generate(["Write a long detailed essay about the history of computing."],
+                 SamplingParams(max_tokens=64, temperature=0, ignore_eos=True), use_tqdm=False)
+    print(">>> WARMUP DONE, starting profiled 256-token decode", flush=True)
 
-ka = prof.key_averages()
-print(ka.table(sort_by="cuda_time_total", row_limit=60), flush=True)
+    from torch.profiler import ProfilerActivity
 
-import csv
-with open("/qwork/prof_r12_kernels.csv", "w", newline="") as f:
-    w = csv.writer(f)
-    w.writerow(["name", "count", "cuda_total_us", "cpu_total_us"])
-    for e in ka:
-        if e.count:
-            w.writerow([e.key, e.count, e.cuda_time_total, e.cpu_time_total])
+    with torch.profiler.profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=False, profile_memory=False, with_stack=False,
+    ) as prof:
+        out = llm.generate(
+            ["Write a long detailed essay about the history of computing."],
+            SamplingParams(max_tokens=256, temperature=0, ignore_eos=True),
+            use_tqdm=False,
+        )
+    print("SAMPLE:", repr(out[0].outputs[0].text[:120]), flush=True)
 
-prof.export_chrome_trace("/qwork/prof_r12_trace.json")
-print("TRACE_EXPORTED /qwork/prof_r12_trace.json", flush=True)
+    ka = prof.key_averages()
+    print(ka.table(sort_by="cuda_time_total", row_limit=60), flush=True)
+
+    import csv
+    with open("/qwork/prof_r12_kernels.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["name", "count", "cuda_total_us", "cpu_total_us"])
+        for e in ka:
+            if e.count:
+                w.writerow([e.key, e.count, e.cuda_time_total, e.cpu_time_total])
+
+    prof.export_chrome_trace("/qwork/prof_r12_trace.json")
+    print("TRACE_EXPORTED /qwork/prof_r12_trace.json", flush=True)
+
+
+if __name__ == "__main__":
+    main()
