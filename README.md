@@ -51,11 +51,15 @@ Any AWQ-INT4 checkpoint works with the kernel patches; the tested one is
 | 10 | `awq_triton.py`: **K-split GEMV for M==1** (`awq_gemv_splitk_kernel` grid (N/BN, 16) + fp32 partials + reduce; INT4 block 13.3 → 9.1 ms/token cold) | **62.3** |
 | 11 | `awq_triton.py`: persistent splitk partials cache (`_SPLITK_PARTIALS`, keyed (N, split, device); graph-safe) | 62.3 (neutral, kept) |
 
-**Decode budget (~16.1 ms/token at 62.3 TPS).** Cold-VRAM kernel math (GPU-1 harness,
-L2-flushed, median-60): INT4 GEMV block 9.1 ms/token (was 13.3 after rung 9's re-sweep; the
-other rows are still inherited from the rung-7 enforce-eager capture — a fresh graphs-on
-capture is the next planned step). Live recovered ~2.6 of rung 10's 4.2 cold ms; the residual
-gap is split between split-K contention/occupancy and the stale elementwise estimate.
+**Decode budget (16.05 ms/token wall at 62.3 TPS; graphs-on capture, Entry 26):**
+device-kernel busy 13.25 ms/token over 1536 launches — INT4 splitk GEMV 6.21 (128 calls) +
+lm_head 2.89 (at byte floor) + paged_attention 1.46 (8 × 183 µs, anomalous) + elementwise/
+norm-parts 1.95 (**1126 launches/token**; RMSNorm = 13-launch chain × 81) + FLA 0.31 + reduce
+0.19 + rest ~0.25; live-wall residual 2.80 (launch/replay/CPU). Next levers, ranked: fused
+RMSNorm (~1.45 ms + 1050 launches), paged-attn decode config (~1.3 ms), splitk occupancy
+(~2.0 ms vs byte floor). Cold INT4 block was 9.1 ms/token — live-warm runs 6.21, i.e. no
+contention inflation; the old live-vs-cold "gap" was mostly non-INT4 budget the rung-7
+capture had under-counted.
 
 Physics ceiling after rung 8 ≈ **113–145 TPS** (weight read 5.4 → ~3.5 GB/token at ~445 GB/s
 effective; was 74–95 before the attention re-quant). Byte-exact floor from checkpoint ground
