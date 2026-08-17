@@ -33,7 +33,7 @@ OpenAI-compatible app at `http://<machine>:8000/v1`.
 - **Registry image**: `ghcr.io/ikantkode/gfx1030-vllm-0.26:latest` (built by CI)
 - **Model**: [`ikantkode/Qwen3.5-4B-AWQ-vd`](https://huggingface.co/ikantkode/Qwen3.5-4B-AWQ-vd)
   — our full-INT4 re-quant (attention + GDN + MLP), 3.8 GB, works on any vLLM AWQ stack
-- **Quantization recipe**: [`Qwen3.5-Quant-Recipe`](https://github.com/ikantkode/Qwen3.5-Quant-Recipe)
+- **Quantization recipe**: [`Qwen3.5-Quant-Recipe`](https://github.com/ikantkode/awq-quant-recipe)
   — the reproducible pipeline incl. the ALS scale-fitter and the two upstream bug
   post-mortems (the `(1+w)` norm-fold defect in the AutoAWQ fork)
 
