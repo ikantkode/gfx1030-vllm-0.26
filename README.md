@@ -1,6 +1,6 @@
 # gfx1030-vllm-0.26 — vLLM 0.26 optimized for AMD RDNA2 (gfx1030 / Radeon PRO V620)
 
-Surgical kernel patches that take **single-stream LLM decode from ~10 to 74.4 tokens/s (7.4×)** on
+Surgical kernel patches that take **single-stream LLM decode from ~10 to 79.1 tokens/s (7.9×)** on
 unsupported AMD gfx1030 hardware — no vLLM rebuild, no Triton fork, all mounted as files into a
 prebuilt docker image.
 
@@ -51,10 +51,13 @@ Any AWQ-INT4 checkpoint works with the kernel patches; the tested one is
 | 10 | `awq_triton.py`: **K-split GEMV for M==1** (`awq_gemv_splitk_kernel` grid (N/BN, 16) + fp32 partials + reduce; INT4 block 13.3 → 9.1 ms/token cold) | **62.3** |
 | 11 | `awq_triton.py`: persistent splitk partials cache (`_SPLITK_PARTIALS`, keyed (N, split, device); graph-safe) | 62.3 (neutral, kept) |
 | 13 | `rmsnorm_gfx1030.py`: **fused Gemma RMSNorm** (one Triton kernel vs the 10–13-launch ATen chain the IR `rms_norm` op falls back to; ×81 norms/token; monkey-patched at import) | **74.4** |
+| 14 | `chunked_prefill_paged_decode.py`: **num_warps=8 at the paged-attn Triton launch** (the stock launch passes no warps → JIT default 4 on a 4-workgroup grid across 72 CUs; latency-bound gather loop halves: 226 → 112 µs/call at seq 281) | **79.1** |
 
-**Decode budget (13.44 ms/token wall at 74.4 TPS; Entry 26/27):**
-INT4 splitk GEMV 6.21 (128 calls) + lm_head 2.89 (at byte floor) + paged_attention 1.46
-(8 × 183 µs, anomalous — next lever) + norms 0.17 (was 1.93 over ~900 launches; now 81 ×
+**Decode budget (12.64 ms/token wall at 79.1 TPS; Entry 26/27/28):**
+INT4 splitk GEMV 6.21 (128 calls) + lm_head 2.89 (at byte floor) + paged_attention 0.80
+(8 × ~100 µs; was 8 × 183 µs — rung 14; the in-tree `paged_attention_rocm` custom kernel is
+triple-dead on this stack: arch-gated away from gfx1030, no HEAD=256 template instantiation,
+non-pow2 528 block size forces the Triton fallback) + norms 0.17 (was 1.93 over ~900 launches; now 81 ×
 ~2.1 µs fused) + FLA 0.31 + reduce 0.19 + rest ~0.3; live-wall residual ~1.9 (launch/replay/
 CPU; rung 13 removed ~850 launches/token, ~1536 → ~700). Cold INT4 block was 9.1 ms/token —
 live-warm runs 6.21, i.e. no contention inflation. Rung 13 root cause: vLLM 0.26 ships fused
@@ -102,7 +105,8 @@ groups, docker + compose plugin.
 ├── gfx1030-patches/
 │   ├── awq_triton.py                # from patches/ in this repo
 │   ├── utils.py                     # from patches/ in this repo
-│   └── rmsnorm_gfx1030.py           # from patches/ in this repo (rung 13)
+│   ├── rmsnorm_gfx1030.py           # from patches/ in this repo (rung 13)
+│   ├── chunked_prefill_paged_decode.py  # from patches/ in this repo (rung 14)
 │   └── .triton/                     # (optional, created on first run) persistent JIT cache
 ├── docker-compose.yml               # from compose/
 └── docker-compose.override.yml      # from compose/ — mounts the patches + cache
@@ -124,7 +128,7 @@ curl -s http://localhost:8000/v1/completions -H 'Content-Type: application/json'
 # measured run
 time curl -s http://localhost:8000/v1/completions -H 'Content-Type: application/json' \
   -d '{"model":"/model","prompt":"Write a long detailed essay about the history of computing.","max_tokens":256,"temperature":0,"ignore_eos":true}'
-# TPS = completion_tokens / wall_seconds  (expect ~62 on a V620)
+# TPS = completion_tokens / wall_seconds  (expect ~79 on a V620)
 ```
 
 ### 5. Applying the patches to a different image/version

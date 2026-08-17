@@ -16,6 +16,8 @@ services:
       - /home/beefyboi1/qwen/gfx1030-patches/utils.py:/src/vllm/vllm/model_executor/layers/utils.py:ro
       # rung 13: fused Gemma RMSNorm (self-applies its monkey-patch on import)
       - /home/beefyboi1/qwen/gfx1030-patches/rmsnorm_gfx1030.py:/src/vllm/vllm/model_executor/layers/rmsnorm_gfx1030.py:ro
+      # rung 14: paged-attn Triton launch num_warps=8 (gfx1030 latency-bound fix)
+      - /home/beefyboi1/qwen/gfx1030-patches/chunked_prefill_paged_decode.py:/src/vllm/vllm/v1/attention/ops/chunked_prefill_paged_decode.py:ro
       # persistent Triton JIT cache -> fast restarts, survives recreate
       - /home/beefyboi1/qwen/gfx1030-patches/.triton:/root/.triton
     command:
