@@ -1,5 +1,9 @@
 # gfx1030-vllm-0.26 — vLLM 0.26 optimized for AMD RDNA2 (gfx1030 / Radeon PRO V620)
 
+**One-command deploy:** see [`deploy/`](deploy/) — `./quickstart.sh` pulls the model
+from Hugging Face, builds the patched image, and serves at ~84 tok/s. Downloadable
+release zips under [Releases](../../releases).
+
 Surgical kernel patches that take **single-stream LLM decode from ~10 to 79.1 tokens/s (7.9×)** on
 unsupported AMD gfx1030 hardware — no vLLM rebuild, no Triton fork, all mounted as files into a
 prebuilt docker image.

@@ -1,0 +1,80 @@
+# Qwen3.5-4B-AWQ-vd serving on Radeon PRO V620 (gfx1030) — one command.
+#
+#   ./quickstart.sh          (downloads the model, then starts everything)
+#   — or manually —
+#   huggingface-cli download ikantkode/Qwen3.5-4B-AWQ-vd --local-dir ./model
+#   docker compose up -d --build
+#
+# All settings below are load-bearing for speed or stability on this GPU.
+
+services:
+  vllm:
+    # Published image (built automatically by CI from this repo). Falls back to a
+    # local build from the repo root if the registry image is unavailable.
+    image: ghcr.io/ikantkode/gfx1030-vllm-0.26:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: qwen-vllm
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    shm_size: "4g"
+    environment:
+      - HSA_OVERRIDE_GFX_VERSION=10.3.0
+      - HIP_FORCE_DEV_KERNARG=1
+      - TORCH_BLAS_PREFER_HIPBLASLT=0
+      - OMP_NUM_THREADS=8
+      - TOKENIZERS_PARALLELISM=false
+      - FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
+      - VLLM_USE_TRITON_AWQ=1
+      - VLLM_USE_DEEP_GEMM=0
+      - VLLM_USE_FLASHINFER_SAMPLER=0
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      # CUDA graphs without torch.compile (torch.compile hard-freezes gfx1030)
+      - VLLM_USE_BREAKABLE_CUDAGRAPH=1
+    volumes:
+      - ./model:/model:ro
+      - ./cache:/root/.triton
+    devices:
+      - /dev/dri
+      - /dev/kfd
+    group_add:
+      - "render"
+      - "video"
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined
+    privileged: false
+    command:
+      - serve
+      - /model
+      - --quantization
+      - awq
+      - --tensor-parallel-size
+      - "1"
+      - --max-model-len
+      - "8192"
+      - --max-num-seqs
+      - "2"
+      - --max-num-batched-tokens
+      - "2048"
+      - --trust-remote-code
+      - --dtype
+      - float16
+      - --attention-backend
+      - ROCM_ATTN
+      - --gpu-memory-utilization
+      - "0.90"
+      - --generation-config
+      - vllm
+      - --enable-chunked-prefill
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --limit-mm-per-prompt
+      - '{"image": 1}'
+      - --mm-processor-kwargs
+      - '{"max_pixels": 1003520}'
