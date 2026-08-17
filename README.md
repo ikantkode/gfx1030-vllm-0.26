@@ -1,6 +1,6 @@
 # gfx1030-vllm-0.26 — vLLM 0.26 optimized for AMD RDNA2 (gfx1030 / Radeon PRO V620)
 
-Surgical kernel patches that take **single-stream LLM decode from ~10 to 62.3 tokens/s (6.2×)** on
+Surgical kernel patches that take **single-stream LLM decode from ~10 to 74.4 tokens/s (7.4×)** on
 unsupported AMD gfx1030 hardware — no vLLM rebuild, no Triton fork, all mounted as files into a
 prebuilt docker image.
 
@@ -50,16 +50,18 @@ Any AWQ-INT4 checkpoint works with the kernel patches; the tested one is
 | 9 | `awq_triton.py`: -vd shape-set GEMV tile re-sweep (135-config grid, L2-flushed; per-(N,K) dispatch table) | 53.7 |
 | 10 | `awq_triton.py`: **K-split GEMV for M==1** (`awq_gemv_splitk_kernel` grid (N/BN, 16) + fp32 partials + reduce; INT4 block 13.3 → 9.1 ms/token cold) | **62.3** |
 | 11 | `awq_triton.py`: persistent splitk partials cache (`_SPLITK_PARTIALS`, keyed (N, split, device); graph-safe) | 62.3 (neutral, kept) |
+| 13 | `rmsnorm_gfx1030.py`: **fused Gemma RMSNorm** (one Triton kernel vs the 10–13-launch ATen chain the IR `rms_norm` op falls back to; ×81 norms/token; monkey-patched at import) | **74.4** |
 
-**Decode budget (16.05 ms/token wall at 62.3 TPS; graphs-on capture, Entry 26):**
-device-kernel busy 13.25 ms/token over 1536 launches — INT4 splitk GEMV 6.21 (128 calls) +
-lm_head 2.89 (at byte floor) + paged_attention 1.46 (8 × 183 µs, anomalous) + elementwise/
-norm-parts 1.95 (**1126 launches/token**; RMSNorm = 13-launch chain × 81) + FLA 0.31 + reduce
-0.19 + rest ~0.25; live-wall residual 2.80 (launch/replay/CPU). Next levers, ranked: fused
-RMSNorm (~1.45 ms + 1050 launches), paged-attn decode config (~1.3 ms), splitk occupancy
-(~2.0 ms vs byte floor). Cold INT4 block was 9.1 ms/token — live-warm runs 6.21, i.e. no
-contention inflation; the old live-vs-cold "gap" was mostly non-INT4 budget the rung-7
-capture had under-counted.
+**Decode budget (13.44 ms/token wall at 74.4 TPS; Entry 26/27):**
+INT4 splitk GEMV 6.21 (128 calls) + lm_head 2.89 (at byte floor) + paged_attention 1.46
+(8 × 183 µs, anomalous — next lever) + norms 0.17 (was 1.93 over ~900 launches; now 81 ×
+~2.1 µs fused) + FLA 0.31 + reduce 0.19 + rest ~0.3; live-wall residual ~1.9 (launch/replay/
+CPU; rung 13 removed ~850 launches/token, ~1536 → ~700). Cold INT4 block was 9.1 ms/token —
+live-warm runs 6.21, i.e. no contention inflation. Rung 13 root cause: vLLM 0.26 ships fused
+`_C` RMSNorm kernels but the IR provider gate wants `weight.dtype == x.dtype` (Gemma-style
+norms pass an fp32 weight) and no op priority is ever configured — so every norm ran the
+composite native chain; the server even logs `Priority not set for op rms_norm, using native
+implementation`.
 
 Physics ceiling after rung 8 ≈ **113–145 TPS** (weight read 5.4 → ~3.5 GB/token at ~445 GB/s
 effective; was 74–95 before the attention re-quant). Byte-exact floor from checkpoint ground
@@ -78,10 +80,12 @@ truth: 3.12 GB/token (INT4 1.85 + tied fp16 lm_head 1.27) → ~142 TPS hard ceil
    check looks clean. `requant/quant.py` post-passes fix the storage to `w = s·(1+w_base) − 1`
    (per-channel s recovered by least squares from the folded consumers). If you re-quant with the
    raw fork and output is gibberish, this is why.
-2. **Elementwise/cast storm** (~4.2 ms/token): spread across 378 casts + 430 copies per token; no
-   single cut. Needs fusion machinery; torch.compile/inductor can freeze gfx1030 (ROCm #5572), so
-   this is parked unless a safe path appears.
-3. **Multi-user phase**: batched throughput on top of this stack (not started).
+2. **paged_attention decode config** (~1.46 ms/token): 8 × 183 µs for ~2.6 MB KV at batch 1 —
+   ~3% of peak BW; should be 10-30 µs. Investigate the ROCm attention dispatch gating first.
+3. **splitk occupancy** (~2.0 ms/token vs byte floor), `fused_qk_rmsnorm_rope` ROCm/VL gate
+   flip, and the remaining elementwise/cast storm: torch.compile/inductor can freeze gfx1030
+   (ROCm #5572), so each needs a hand-fused or dispatch-level fix.
+4. **Multi-user phase**: batched throughput on top of this stack (not started).
 
 ---
 
@@ -98,6 +102,7 @@ groups, docker + compose plugin.
 ├── gfx1030-patches/
 │   ├── awq_triton.py                # from patches/ in this repo
 │   ├── utils.py                     # from patches/ in this repo
+│   └── rmsnorm_gfx1030.py           # from patches/ in this repo (rung 13)
 │   └── .triton/                     # (optional, created on first run) persistent JIT cache
 ├── docker-compose.yml               # from compose/
 └── docker-compose.override.yml      # from compose/ — mounts the patches + cache
@@ -168,7 +173,8 @@ budget table above).
 
 ## Repo layout
 ```
-patches/    awq_triton.py(.orig/.patch), utils.py(.orig/.patch)
+patches/    awq_triton.py(.orig/.patch), utils.py(.orig/.patch), rmsnorm_gfx1030.py,
+            gates/ (test_r13*.py — offline numerics + launch-count + device-time gate)
 compose/    docker-compose.yml + override (the working serving config)
 benches/    live kernel sweep harnesses (AWQ gemv/dot, fp16 gemv, FLA)
 profiling/  offline decode-attribution scripts

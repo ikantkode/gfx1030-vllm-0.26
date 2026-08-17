@@ -14,6 +14,8 @@ services:
       # persistent gfx1030 kernel patches (survive container recreate)
       - /home/beefyboi1/qwen/gfx1030-patches/awq_triton.py:/src/vllm/vllm/model_executor/layers/quantization/awq_triton.py:ro
       - /home/beefyboi1/qwen/gfx1030-patches/utils.py:/src/vllm/vllm/model_executor/layers/utils.py:ro
+      # rung 13: fused Gemma RMSNorm (self-applies its monkey-patch on import)
+      - /home/beefyboi1/qwen/gfx1030-patches/rmsnorm_gfx1030.py:/src/vllm/vllm/model_executor/layers/rmsnorm_gfx1030.py:ro
       # persistent Triton JIT cache -> fast restarts, survives recreate
       - /home/beefyboi1/qwen/gfx1030-patches/.triton:/root/.triton
     command:

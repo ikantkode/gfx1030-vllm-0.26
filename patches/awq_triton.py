@@ -5,6 +5,10 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+# Rung 13: fused Gemma RMSNorm for gfx1030 — imported here so every process
+# that loads the AWQ kernels (incl. the V1 engine child) applies the patch.
+import vllm.model_executor.layers.rmsnorm_gfx1030  # noqa: F401
+
 AWQ_TRITON_SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]
 
 
