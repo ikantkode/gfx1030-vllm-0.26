@@ -23,7 +23,7 @@ per-rung detail, offline gates, and A/B fidelity evidence).
 | 12 | — | Topology review only, no code (decode fully attributed, Entry 26) | `afe0c8f`/`34623ce` (profiling + budget) |
 | 13 | 74.4 | **Fused Gemma RMSNorm** (Triton, 1 kernel vs 10–13-launch native chain ×81/token) | `9d4f668` · tag `rung-13-74.4tps` |
 | 14 | **79.1** | **Paged-attn Triton `num_warps=8`** (grid of 4 workgroups on 72 CUs was latency-bound; 226→112 µs/call) | `5f01e3c` · tag `rung-14-79.1tps` |
-| 15 | **84.5** | **Per-shape splitk config table** (true decode set = 120 calls/5 shapes, not the stale 6-shape table; big-N K=2560 → BN=128/BK=32/SP=4/W=4, 64 B/row contiguous reads). Win is a live L2/launch/occupancy effect, NOT a per-shape cold-kernel win (that protocol is floor-dominated ~190 µs, can't resolve it). A/B 5/5 byte-identical. | `TBD` · tag `rung-15-84.5tps` |
+| 15 | **84.5** | **Per-shape splitk config table** (true decode set = 120 calls/5 shapes, not the stale 6-shape table; big-N K=2560 → BN=128/BK=32/SP=4/W=4, 64 B/row contiguous reads). Win is a live L2/launch/occupancy effect, NOT a per-shape cold-kernel win (that protocol is floor-dominated ~190 µs, can't resolve it). A/B 5/5 byte-identical. | `df4a71b` · tag `rung-15-84.5tps` |
 
 Decode wall: 100+ ms → **12.64 ms/token** at rung 14 → **~11.9 ms/token** at rung 15 (8.4×).
 Hard ceiling ≈ 142 TPS (3.12 GB/token @ ~445 GB/s); realistic ceiling 85–95.
