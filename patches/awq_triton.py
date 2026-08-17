@@ -604,10 +604,30 @@ def awq_gemm_triton(
         #   N=2560 K=4096 (x32): 52.4 -> 32.3us
         #   N=1024 K=2560 (x16): 36.3 -> 18.7us
         # INT4 GEMV block 13.33 -> 9.10 ms/token; projected ~69 TPS.
+        # [gfx1030] Rung 15: the rung-9/10 shape table above is STALE - the
+        # true -vd decode GEMV set is 120 calls/token over 5 shapes (1.74 GB;
+        # probe_sk2.py, GPU 1, live-config capture): (N,K) x count
+        #   (18432,2560) x30 (fused gate+up)  (12288,2560) x22
+        #   (10240,2560) x8  (2560,9216) x30 (MLP down)  (2560,4096) x30
+        # Re-swept those true shapes (probe_sk2 sweep, L2-flushed cold med-30,
+        # rel<0.02 vs live-cfg ref): the three big-N K=2560 shapes all want
+        # BN=128 (64 B/row contiguous reads vs 32 B at BN=64) + SP=4/W=4:
+        #   (18432,2560): 92.9 -> 78.8us (-0.422ms/token)
+        #   (12288,2560): 69.7 -> 60.4us (-0.204)
+        #   (10240,2560): 60.1 -> 53.0us (-0.057)
+        #   (2560,9216) : 52.2 -> 50.9us at 128/64/16/W2 (-0.040, marginal)
+        #   (2560,4096) : 32.4 ~ 32.3us, keep live cfg (latency-bound, 37% peak)
+        # Splitk block 7.34 -> 6.62 ms; decode 12.64 -> ~11.9 ms = ~84 TPS.
         # Gate = the wrapper's asserts, checked here to stay assert-free.
         if K % 16 == 0 and (K // 16) % 32 == 0 and group_size % 32 == 0:
+            bn, bk, sp, w = {
+                (18432, 2560): (128, 32, 4, 4),
+                (12288, 2560): (128, 32, 4, 4),
+                (10240, 2560): (128, 32, 4, 4),
+                (2560, 9216): (128, 64, 16, 2),
+            }.get((N, K), (64, 32, 16, 2))
             return awq_gemv_splitk_triton(
-                input, qweight, scales, qzeros, 64, 32, 16, 2, 3,
+                input, qweight, scales, qzeros, bn, bk, sp, w, 3,
             )
         # [gfx1030] dedicated GEMV path (no tl.dot M-tile waste). Rung 9:
         # re-swept over the full -vd shape set (6 unique shapes, 135-config
