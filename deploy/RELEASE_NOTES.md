@@ -25,7 +25,7 @@ OpenAI-compatible app at `http://<machine>:8000/v1`.
 
 ## What's inside
 
-- **15 measured optimization rungs** (10 → 84.5 tok/s): custom AWQ INT4 GEMV kernels,
+- **18 measured optimization rungs** (10 → 84.5 tok/s single-stream, 966.6 tok/s at the 128-user knee): custom AWQ INT4 GEMV kernels,
   AMD LLMM1 unlock for gfx1030, K-split decode, fused RMSNorm, tuned paged attention —
   see `CHANGELOG.md` for every step with its commit
 - **Deploy kit** (`deploy/`): Dockerfile (patches baked into `blivioniag/vllm-rdna:v0.26.0`
@@ -42,7 +42,7 @@ OpenAI-compatible app at `http://<machine>:8000/v1`.
 | | stock | this release |
 |---|---|---|
 | Single-stream decode | ~10 tok/s | **84.5 tok/s** |
-| 5 concurrent users | — | 147 tok/s aggregate |
+| Multi-user knee (128 concurrent) | — | **966.6 tok/s** aggregate (+43.6% over stock tiles) |
 | Model size (vs reference AWQ) | 5.7 GB | 3.8 GB |
 
 ## Requirements
