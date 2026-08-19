@@ -10,7 +10,7 @@ tags:
 - vllm
 ---
 
-# Qwen3.5-4B-AWQ-vd-lmhead-int4
+# Qwen3.5-4B-AWQ-vd (v1.1.0 — INT4 lm_head)
 
 An independently re-quantized **AWQ INT4** build of Qwen/Qwen3.5-4B with **all linear
 projections quantized** — self-attention (8 full-attention layers), the gated
@@ -18,7 +18,8 @@ delta-net / linear-attention projections (24 layers), the MLPs, **and the lm_hea
 while keeping `in_proj_a`/`in_proj_b`, norms, the input embeddings and the MTP head in
 fp16.
 
-This is **v1.1.0** of the `Qwen3.5-4B-AWQ-vd` family. It is the v1.0.0 `-vd` checkpoint
+**v1.1.0 is a revision of this same repo** (no new checkpoint id — re-pull
+`ikantkode/Qwen3.5-4B-AWQ-vd`). It is the v1.0.0 `-vd` checkpoint
 plus one change: the **lm_head** (the 2560 → 248320 vocab projection, the single largest
 decode GEMV, a 1.56 GB fp16 read every token) is now re-quantized to the same AWQ INT4
 as the rest. The head is **untied** — `tie_word_embeddings: false` (top-level and in
@@ -69,7 +70,7 @@ image is unchanged from v1.0.0 — the win is entirely in these weights.
 ## Usage
 
 ```bash
-vllm serve ikantkode/Qwen3.5-4B-AWQ-vd-lmhead-int4 --dtype float16 --max-model-len 8192
+vllm serve ikantkode/Qwen3.5-4B-AWQ-vd --dtype float16 --max-model-len 8192
 ```
 
 Or one-command on a Radeon PRO V620 / gfx1030:
@@ -86,6 +87,7 @@ Or one-command on a Radeon PRO V620 / gfx1030:
 - `model_mtp.safetensors`: MTP head for speculative decoding (`qwen3_next_mtp`).
   Note: on gfx1030 with heavily M=1-optimized decode kernels, MTP verification was
   measurably slower than plain decoding; on other stacks it may help.
-- Predecessor: [`ikantkode/Qwen3.5-4B-AWQ-vd`](https://huggingface.co/ikantkode/Qwen3.5-4B-AWQ-vd)
-  (v1.0.0, fp16 lm_head, 84.5 tok/s)
+- Predecessor: the v1.0.0 revision of this same repo
+  ([`ikantkode/Qwen3.5-4B-AWQ-vd`](https://huggingface.co/ikantkode/Qwen3.5-4B-AWQ-vd);
+  fp16 lm_head, 84.5 tok/s). v1.1.0 adds `model_lmhead.safetensors` in place.
 - Full technical trail: `ikantkode/gfx1030-vllm-0.26` (README + PROGRESS log)

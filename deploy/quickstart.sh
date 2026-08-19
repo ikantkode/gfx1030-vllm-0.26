@@ -5,7 +5,9 @@ cd "$(dirname "$0")"
 
 if [ ! -f model/config.json ]; then
   echo ">> Downloading the model (about 5 GB, one time only)..."
-  huggingface-cli download ikantkode/Qwen3.5-4B-AWQ-vd-lmhead-int4 --local-dir ./model
+  # v1.1.0 is a revision of the SAME repo (ikantkode/Qwen3.5-4B-AWQ-vd) — the INT4
+  # lm_head was added in place, no new checkpoint id. Re-pull to pick up the revision.
+  huggingface-cli download ikantkode/Qwen3.5-4B-AWQ-vd --local-dir ./model
 fi
 
 echo ">> Building/starting the server (first run takes a few minutes)..."

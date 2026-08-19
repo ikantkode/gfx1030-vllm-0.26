@@ -9,7 +9,7 @@ decode from ~10 to 97.9 tokens/s (9.8×)** on unsupported AMD gfx1030 hardware �
 rebuild, no Triton fork, all mounted as files into a prebuilt docker image (v1.1.0: the
 lm_head is now INT4 in the model weights — the image itself is unchanged from v1.0.0).
 
-Tested with: `ikantkode/Qwen3.5-4B-AWQ-vd-lmhead-int4` (hybrid GDN linear-attention +
+Tested with: `ikantkode/Qwen3.5-4B-AWQ-vd` (v1.1.0 — INT4 lm_head; hybrid GDN linear-attention +
 full-attention multimodal model, AWQ-INT4 MLP + attention + **lm_head** — our re-quant of
 `Qwen/Qwen3.5-4B`, see `requant/`; distinct from `QuantTrio/Qwen3.5-4B-AWQ` used at
 rungs 0–7),
@@ -28,10 +28,10 @@ Everything in this repo is **file-mount patches** on top of that image. You neve
 ## Model
 
 Any AWQ-INT4 checkpoint works with the kernel patches; the tested one is
-[`ikantkode/Qwen3.5-4B-AWQ-vd-lmhead-int4`](https://huggingface.co/ikantkode/Qwen3.5-4B-AWQ-vd-lmhead-int4)
+[`ikantkode/Qwen3.5-4B-AWQ-vd`](https://huggingface.co/ikantkode/Qwen3.5-4B-AWQ-vd)
 (~5 GB, full-INT4 incl. the lm_head — v1.1.0). The v1.0.0 checkpoint
 [`ikantkode/Qwen3.5-4B-AWQ-vd`](https://huggingface.co/ikantkode/Qwen3.5-4B-AWQ-vd)
-(fp16 lm_head) still works and gives 84.5 tok/s; the lmhead-int4 build adds the
+(the v1.0.0 revision) gave 84.5 tok/s; v1.1.0 of the same repo adds the
 +15.9% single-stream win.
 
 ---
@@ -64,7 +64,7 @@ Any AWQ-INT4 checkpoint works with the kernel patches; the tested one is
 | 14 | `chunked_prefill_paged_decode.py`: **num_warps=8 at the paged-attn Triton launch** (the stock launch passes no warps → JIT default 4 on a 4-workgroup grid across 72 CUs; latency-bound gather loop halves: 226 → 112 µs/call at seq 281) | **79.1** |
 | 15 | `awq_triton.py`: **per-shape splitk config table** (true decode set = 120 calls/5 shapes; big-N K=2560 → BN=128/BK=32/SP=4/W=4) | **84.5** |
 | 16/18 | `awq_triton.py`: **M>32 + M≤32 per-(N,K) tiled-GEMM tables** (multi-user knee; single-stream unchanged — see CHANGELOG) | 84.5¹ |
-| 19 | **Re-quant the lm_head to INT4** (the single largest decode GEMV, 2560→248320; checkpoint `-lmhead-int4`, kernel-neutral — the image is unchanged from v1.0.0) | **97.9** |
+| 19 | **Re-quant the lm_head to INT4** (the single largest decode GEMV, 2560→248320; added in place to the `-vd` repo as v1.1.0, kernel-neutral — the image is unchanged from v1.0.0) | **97.9** |
 
 ¹ Rungs 16/18 move the 128-user knee (966.6 tok/s aggregate), not single-stream.
 
@@ -99,7 +99,7 @@ the split-K decode GEMV (~5.5 ms/token) is the dominant remaining gap to the cei
    (`tie_word_embeddings: false` + `quantization_config.lm_head: true`) and ship the head under the
    top-level `lm_head.` prefix in `model_lmhead.safetensors` (the vLLM 0.26 load path). Kernel-
    neutral: the stock `awq_triton.py` serves the N=248320 K=2560 shape (SPLIT_K=1). See
-   `requant/` and the `ikantkode/Qwen3.5-4B-AWQ-vd-lmhead-int4` checkpoint.
+   `requant/` and the INT4 lm_head added to the `ikantkode/Qwen3.5-4B-AWQ-vd` repo (v1.1.0).
    **Gotcha that cost a day:** the fork's activation-smoothing writes input-LN folds Llama-style
    (`w = s·w_base`), but Qwen3.5's RMSNorm applies gain `(1 + w)` — the delivered scale becomes
    `(1+s·w)` instead of `s·(1+w)` and generation is garbage at serve time while every per-module

@@ -1,6 +1,6 @@
 # Release v1.1.0 — notes for the GitHub Release
 
-**Title:** v1.1.0 — 97.9 tok/s Qwen3.5-4B on Radeon PRO V620 (gfx1030) — INT4 lm_head
+**Title:** v1.1.0 — 97.9 tok/s Qwen3.5-4B on Radeon PRO V620 (gfx1030) — INT4 lm_head (revision of `ikantkode/Qwen3.5-4B-AWQ-vd`)
 
 **Body:**
 
@@ -23,7 +23,7 @@ cache. The win is entirely in the **model weights**. Point your existing server 
 new checkpoint and you're done:
 
 ```bash
-huggingface-cli download ikantkode/Qwen3.5-4B-AWQ-vd-lmhead-int4 --local-dir ./model
+huggingface-cli download ikantkode/Qwen3.5-4B-AWQ-vd --local-dir ./model
 docker compose up -d          # or just re-run your serve with the new path
 ```
 
@@ -31,7 +31,7 @@ No rebuild, no patch change. If you rebuilt the image for this release you waste
 
 ## What's inside
 
-- **New checkpoint**: [`ikantkode/Qwen3.5-4B-AWQ-vd-lmhead-int4`](https://huggingface.co/ikantkode/Qwen3.5-4B-AWQ-vd-lmhead-int4)
+- **Checkpoint (revised in place)**: [`ikantkode/Qwen3.5-4B-AWQ-vd`](https://huggingface.co/ikantkode/Qwen3.5-4B-AWQ-vd) — v1.1.0 adds the INT4 `lm_head` to the SAME repo; no new checkpoint id. Re-pull `ikantkode/Qwen3.5-4B-AWQ-vd` to get it.
   — the full v1.0.0 `-vd` re-quant **plus** the lm_head in AWQ INT4. The head is
   untied (`tie_word_embeddings: false` + `quantization_config.lm_head: true`) with its
   weights under the top-level `lm_head.` prefix in `model_lmhead.safetensors` — exactly
