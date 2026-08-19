@@ -26,6 +26,7 @@ per-rung detail, offline gates, and A/B fidelity evidence).
 | 15 | **84.5** | **Per-shape splitk config table** (true decode set = 120 calls/5 shapes, not the stale 6-shape table; big-N K=2560 → BN=128/BK=32/SP=4/W=4, 64 B/row contiguous reads). Win is a live L2/launch/occupancy effect, NOT a per-shape cold-kernel win (that protocol is floor-dominated ~190 µs, can't resolve it). A/B 5/5 byte-identical. | `df4a71b` · tag `rung-15-84.5tps` |
 | 16 | **84.5**¹ | **M>32 tiled GEMM per-(N,K) table** (the multi-user "knee" branch, left at stock BM32/BN32/BK32 W4 S3). Focused M=128 sweep, 144-config grid, correctness-gated vs dequant: ONE tile (64,128,32,8,2) wins all five shapes, only split-K varies (18432→sk1, the two mid K=2560→sk4, the two K≥4096→sk8). 2.02× on the per-step AWQ block (57→115 GB/s). Single-stream TPS unchanged — the win is on the 16+ seq knee. | `this` · see v1.0.0 |
 | 18 | **84.5**¹ | **M≤32 per-(N,K)×M-band table** (decode M∈{8,16,32}; ceiling band-selection). M=8/16/32 sweeps on the 5 -vd shapes: per-shape winners keyed by (N,K) with M-band ceiling (M=10 → the (16,)-band config, the M≤32 tiled GEMM at M=10). Closes the last untuned branch. Single-stream TPS unchanged. | `this` · see v1.0.0 |
+| 19 | **97.9** | **INT4 lm_head** (the single largest decode GEMV). New checkpoint `-lmhead-int4`: the 2560→248320 head (1.56 GB fp16) re-quantized to the same AWQ INT4 as the rest — head read 2.9 → 0.7 ms/token (−2.2 ms, ~1.1 GB less read per token). Untied (`tie_word_embeddings: false` + `quantization_config.lm_head: true`), weights under the top-level `lm_head.` prefix (the vLLM-0.26 load path) in `model_lmhead.safetensors`. Kernel-neutral — the stock `awq_triton.py` handles it (N=248320 K=2560 → SPLIT_K=1; M>32 band auto-extends). Single-stream +15.9% (84.5 → 97.9). | `this` · see v1.1.0 |
 
 ¹ Rungs 16+18 are **multi-user** wins — the mns=128 (128-concurrent) knee, not the
 single-stream mns=1 ladder, which stays at 84.5. Measured on the in-process
@@ -37,6 +38,21 @@ warmup). Full 4-gate set PASS: offline numerics (A1 15/15 max rel 0.0186, A2 5/5
 
 Decode wall: 100+ ms → **12.64 ms/token** at rung 14 → **~11.9 ms/token** at rung 15 (8.4×).
 Hard ceiling ≈ 142 TPS (3.12 GB/token @ ~445 GB/s); realistic ceiling 85–95.
+
+## v1.1.0
+**INT4 lm_head (rung 19):** 84.5 → **97.9 tok/s** single-stream (+15.9%). The change is a
+**checkpoint, not a patch** — the lm_head GEMV is re-quantized to AWQ INT4 in
+`ikantkode/Qwen3.5-4B-AWQ-vd-lmhead-int4`. The Docker image and every kernel patch are
+**byte-identical to v1.0.0** — do **not** rebuild the image expecting changes; just point
+the serve at the new checkpoint.
+
+The multi-user gain is **front-loaded**: the head saves a fixed ~2.2 ms/token, which is a
+large fraction of the short low-batch step but a sliver of the weight-bandwidth-bound
+high-batch step (full AWQ weight matrix ≈ 1.7 GB/token). Re-measured knee (INT4 head,
+graphs on, mns ladder): mns=16 **433.6 → 553.1** (+27.6%), mns=32 642.7 → 728.7 (+13.4%),
+mns=64 862.4 → 920.4 (+6.7%), mns=128 966.6 → 955.8 (−1.1%, **treat as unchanged** —
+single-batch noise). So v1.1's story is: **+15.9% single-stream (the headline) and +7–28%
+multi-user mid-range; the 128-user peak aggregate is unchanged.**
 
 ## v1.0.0
 First full release: rungs 0–18 in one stack. `patches/awq_triton.py` now carries all

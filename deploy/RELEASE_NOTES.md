@@ -1,51 +1,68 @@
-# Release v1.0.0 — notes for the GitHub Release
+# Release v1.1.0 — notes for the GitHub Release
 
-**Title:** v1.0.0 — 84.5 tok/s Qwen3.5-4B on Radeon PRO V620 (gfx1030)
+**Title:** v1.1.0 — 97.9 tok/s Qwen3.5-4B on Radeon PRO V620 (gfx1030) — INT4 lm_head
 
 **Body:**
 
 ---
 
-## What this is
+## What changed since v1.0.0
 
-A complete, working stack to run **Qwen 3.5 4B at ~84 tokens/second on an AMD Radeon
-PRO V620** — hardware vLLM doesn't officially support well. **9× faster than the
-stock setup**, quality-verified at every step.
+One new checkpoint. The **lm_head** — the single largest GEMV in the decode step, a
+2560 → 248320 (vocab) projection that was still in fp16 (a 1.56 GB read every token) —
+is now re-quantized to the same **AWQ INT4** as the rest of the model.
 
-## The one-liner
+**Single-stream decode: 84.5 → 97.9 tok/s (+15.9%).** The head read drops
+2.9 → 0.7 ms/token (−2.2 ms, ~1.1 GB less read per token).
 
-Download this release (zip/tar below), then:
+## ⚠️ The Docker image is UNCHANGED — do not rebuild
+
+Everything on the kernel side is **byte-identical to v1.0.0** — same
+`blivioniag/vllm-rdna:v0.26.0` base, same ghcr image, same mounted patches, same Triton
+cache. The win is entirely in the **model weights**. Point your existing server at the
+new checkpoint and you're done:
 
 ```bash
-cd gfx1030-vllm-0.26*/deploy && ./quickstart.sh
+huggingface-cli download ikantkode/Qwen3.5-4B-AWQ-vd-lmhead-int4 --local-dir ./model
+docker compose up -d          # or just re-run your serve with the new path
 ```
 
-Downloads the model, builds the patched image, starts the server. Point any
-OpenAI-compatible app at `http://<machine>:8000/v1`.
+No rebuild, no patch change. If you rebuilt the image for this release you wasted time.
 
 ## What's inside
 
-- **18 measured optimization rungs** (10 → 84.5 tok/s single-stream, 966.6 tok/s at the 128-user knee): custom AWQ INT4 GEMV kernels,
-  AMD LLMM1 unlock for gfx1030, K-split decode, fused RMSNorm, tuned paged attention —
-  see `CHANGELOG.md` for every step with its commit
-- **Deploy kit** (`deploy/`): Dockerfile (patches baked into `blivioniag/vllm-rdna:v0.26.0`
-  — no vLLM rebuild), docker-compose, one-command quickstart
-- **Registry image**: `ghcr.io/ikantkode/gfx1030-vllm-0.26:latest` (built by CI)
-- **Model**: [`ikantkode/Qwen3.5-4B-AWQ-vd`](https://huggingface.co/ikantkode/Qwen3.5-4B-AWQ-vd)
-  — our full-INT4 re-quant (attention + GDN + MLP), 3.8 GB, works on any vLLM AWQ stack
-- **Quantization recipe**: [`Qwen3.5-Quant-Recipe`](https://github.com/ikantkode/awq-quant-recipe)
-  — the reproducible pipeline incl. the ALS scale-fitter and the two upstream bug
-  post-mortems (the `(1+w)` norm-fold defect in the AutoAWQ fork)
+- **New checkpoint**: [`ikantkode/Qwen3.5-4B-AWQ-vd-lmhead-int4`](https://huggingface.co/ikantkode/Qwen3.5-4B-AWQ-vd-lmhead-int4)
+  — the full v1.0.0 `-vd` re-quant **plus** the lm_head in AWQ INT4. The head is
+  untied (`tie_word_embeddings: false` + `quantization_config.lm_head: true`) with its
+  weights under the top-level `lm_head.` prefix in `model_lmhead.safetensors` — exactly
+  the load path vLLM 0.26 expects.
+- **Kernel-neutral**: the stock `awq_triton.py` already handles the head shape
+  (N=248320, K=2560 → SPLIT_K=1; the M>32 band auto-extends). No new table entry.
+- **Everything else from v1.0.0** (rungs 0–18, deploy kit, ghcr image, quant recipe) is
+  unchanged.
 
 ## Measured
 
-| | stock | this release |
+| | v1.0.0 | v1.1.0 |
 |---|---|---|
-| Single-stream decode | ~10 tok/s | **84.5 tok/s** |
-| Multi-user knee (128 concurrent) | — | **966.6 tok/s** aggregate (+43.6% over stock tiles) |
-| Model size (vs reference AWQ) | 5.7 GB | 3.8 GB |
+| Single-stream decode | 84.5 tok/s | **97.9 tok/s** (+15.9%) |
+| Multi-user, 16 concurrent | 433.6 tok/s | **553.1 tok/s** (+27.6%) |
+| Multi-user, 32 concurrent | 642.7 tok/s | 728.7 tok/s (+13.4%) |
+| Multi-user, 64 concurrent | 862.4 tok/s | 920.4 tok/s (+6.7%) |
+| Multi-user, 128 concurrent (peak) | 966.6 tok/s | 955.8 tok/s (**unchanged** — noise) |
+
+The multi-user gain is **front-loaded**: the head saves a fixed ~2.2 ms/token, a large
+fraction of the short low-batch step but a sliver of the weight-bandwidth-bound
+high-batch step (the full AWQ weight matrix is ~1.7 GB/token). Mid-range concurrency
+(≤~64 users) gains +7–28%; the 128-user peak aggregate does not move.
 
 ## Requirements
 
-V620/RX6800-class 32 GB GPU · ROCm · Docker. Quality gates: per-module ≤ 0.11 rel-err
-vs base weights; 5-prompt A/B equivalent to the reference checkpoint.
+Unchanged from v1.0.0 — V620/RX6800-class 32 GB GPU · ROCm · Docker. Quality gates:
+head module ≤ 0.11 relative error vs base weights; full 4-gate set (offline numerics,
+single-stream bench, knee ladder, 5-prompt A/B) PASS.
+
+## What's next (not in this release)
+
+Phase 4 — GEMV polish + glue fusion, profile-first. The split-K decode GEMV (~5.5
+ms/token) is now the biggest single remaining cost; the head is down to ~0.7 ms.

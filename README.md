@@ -1,16 +1,18 @@
 # gfx1030-vllm-0.26 — vLLM 0.26 optimized for AMD RDNA2 (gfx1030 / Radeon PRO V620)
 
 **One-command deploy:** see [`deploy/`](deploy/) — `./quickstart.sh` pulls the model
-from Hugging Face, builds the patched image, and serves at ~84 tok/s. Downloadable
+from Hugging Face, builds the patched image, and serves at ~98 tok/s. Downloadable
 release zips under [Releases](../../releases).
 
-Surgical kernel patches that take **single-stream LLM decode from ~10 to 79.1 tokens/s (7.9×)** on
-unsupported AMD gfx1030 hardware — no vLLM rebuild, no Triton fork, all mounted as files into a
-prebuilt docker image.
+Surgical kernel patches **plus one re-quantized checkpoint** that take **single-stream LLM
+decode from ~10 to 97.9 tokens/s (9.8×)** on unsupported AMD gfx1030 hardware — no vLLM
+rebuild, no Triton fork, all mounted as files into a prebuilt docker image (v1.1.0: the
+lm_head is now INT4 in the model weights — the image itself is unchanged from v1.0.0).
 
-Tested with: `Qwen3.5-4B-AWQ-vd` (hybrid GDN linear-attention + full-attention multimodal model,
-AWQ-INT4 MLP + attention — our re-quant of `Qwen/Qwen3.5-4B`, see `requant/`; distinct from
-`QuantTrio/Qwen3.5-4B-AWQ` used at rungs 0–7),
+Tested with: `ikantkode/Qwen3.5-4B-AWQ-vd-lmhead-int4` (hybrid GDN linear-attention +
+full-attention multimodal model, AWQ-INT4 MLP + attention + **lm_head** — our re-quant of
+`Qwen/Qwen3.5-4B`, see `requant/`; distinct from `QuantTrio/Qwen3.5-4B-AWQ` used at
+rungs 0–7),
 2× AMD Radeon PRO V620 (gfx1030, RDNA2, 32 GB), ROCm 7.2 host driver, Ubuntu 24.04.
 
 ---
@@ -26,7 +28,11 @@ Everything in this repo is **file-mount patches** on top of that image. You neve
 ## Model
 
 Any AWQ-INT4 checkpoint works with the kernel patches; the tested one is
-[`QuantTrio/Qwen3.5-4B-AWQ`](https://huggingface.co/QuantTrio/Qwen3.5-4B-AWQ) (~6 GB).
+[`ikantkode/Qwen3.5-4B-AWQ-vd-lmhead-int4`](https://huggingface.co/ikantkode/Qwen3.5-4B-AWQ-vd-lmhead-int4)
+(~5 GB, full-INT4 incl. the lm_head — v1.1.0). The v1.0.0 checkpoint
+[`ikantkode/Qwen3.5-4B-AWQ-vd`](https://huggingface.co/ikantkode/Qwen3.5-4B-AWQ-vd)
+(fp16 lm_head) still works and gives 84.5 tok/s; the lmhead-int4 build adds the
++15.9% single-stream win.
 
 ---
 
@@ -56,9 +62,14 @@ Any AWQ-INT4 checkpoint works with the kernel patches; the tested one is
 | 11 | `awq_triton.py`: persistent splitk partials cache (`_SPLITK_PARTIALS`, keyed (N, split, device); graph-safe) | 62.3 (neutral, kept) |
 | 13 | `rmsnorm_gfx1030.py`: **fused Gemma RMSNorm** (one Triton kernel vs the 10–13-launch ATen chain the IR `rms_norm` op falls back to; ×81 norms/token; monkey-patched at import) | **74.4** |
 | 14 | `chunked_prefill_paged_decode.py`: **num_warps=8 at the paged-attn Triton launch** (the stock launch passes no warps → JIT default 4 on a 4-workgroup grid across 72 CUs; latency-bound gather loop halves: 226 → 112 µs/call at seq 281) | **79.1** |
+| 15 | `awq_triton.py`: **per-shape splitk config table** (true decode set = 120 calls/5 shapes; big-N K=2560 → BN=128/BK=32/SP=4/W=4) | **84.5** |
+| 16/18 | `awq_triton.py`: **M>32 + M≤32 per-(N,K) tiled-GEMM tables** (multi-user knee; single-stream unchanged — see CHANGELOG) | 84.5¹ |
+| 19 | **Re-quant the lm_head to INT4** (the single largest decode GEMV, 2560→248320; checkpoint `-lmhead-int4`, kernel-neutral — the image is unchanged from v1.0.0) | **97.9** |
 
-**Decode budget (12.64 ms/token wall at 79.1 TPS; Entry 26/27/28):**
-INT4 splitk GEMV 6.21 (128 calls) + lm_head 2.89 (at byte floor) + paged_attention 0.80
+¹ Rungs 16/18 move the 128-user knee (966.6 tok/s aggregate), not single-stream.
+
+**Decode budget** (12.64 ms/token wall at 79.1 TPS; Entry 26/27/28):
+INT4 splitk GEMV 6.21 (128 calls) + lm_head 2.89 (at fp16 byte floor) + paged_attention 0.80
 (8 × ~100 µs; was 8 × 183 µs — rung 14; the in-tree `paged_attention_rocm` custom kernel is
 triple-dead on this stack: arch-gated away from gfx1030, no HEAD=256 template instantiation,
 non-pow2 528 block size forces the Triton fallback) + norms 0.17 (was 1.93 over ~900 launches; now 81 ×
@@ -72,15 +83,23 @@ implementation`.
 
 Physics ceiling after rung 8 ≈ **113–145 TPS** (weight read 5.4 → ~3.5 GB/token at ~445 GB/s
 effective; was 74–95 before the attention re-quant). Byte-exact floor from checkpoint ground
-truth: 3.12 GB/token (INT4 1.85 + tied fp16 lm_head 1.27) → ~142 TPS hard ceiling.
+truth (v1.1.0, untied INT4 lm_head): **~2.0 GB/token** (INT4 1.85 + INT4 lm_head ~0.25) →
+**~175 TPS hard ceiling** (was 3.12 GB/token / ~142 with the tied fp16 head). We're at 97.9 —
+the split-K decode GEMV (~5.5 ms/token) is the dominant remaining gap to the ceiling.
 
 ## Roadmap
 
 1. ~~**Re-quantize `self_attn` + `linear_attn` to INT4**~~ — **DONE, rung 8, 51.7 TPS** (see
    `requant/`). Cuts the FP16 read 2.53 → 0.65 GB/token; ceiling → 113–145 TPS. Uses the
    [`quivent/autoawq-qwen35`](https://github.com/quivent/autoawq-qwen35) AutoAWQ fork; the patched
-   GEMV kernel automatically serves every newly-quantized layer. lm_head is **not** quantizable
-   (tied embeddings — vLLM never creates a quantizable lm_head module).
+   GEMV kernel automatically serves every newly-quantized layer.
+2a. ~~**Re-quantize the lm_head to INT4**~~ — **DONE, rung 19, 97.9 TPS (v1.1.0)**. The head is
+   the single largest decode GEMV (2560→248320, 1.56 GB fp16). It was originally "not quantizable"
+   (tied embeddings — vLLM never creates a quantizable lm_head module); the fix is to **untie**
+   (`tie_word_embeddings: false` + `quantization_config.lm_head: true`) and ship the head under the
+   top-level `lm_head.` prefix in `model_lmhead.safetensors` (the vLLM 0.26 load path). Kernel-
+   neutral: the stock `awq_triton.py` serves the N=248320 K=2560 shape (SPLIT_K=1). See
+   `requant/` and the `ikantkode/Qwen3.5-4B-AWQ-vd-lmhead-int4` checkpoint.
    **Gotcha that cost a day:** the fork's activation-smoothing writes input-LN folds Llama-style
    (`w = s·w_base`), but Qwen3.5's RMSNorm applies gain `(1 + w)` — the delivered scale becomes
    `(1+s·w)` instead of `s·(1+w)` and generation is garbage at serve time while every per-module

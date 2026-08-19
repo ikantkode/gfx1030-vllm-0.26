@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# One-line setup: download the model (~4 GB, once) and start the server.
+# One-line setup: download the model (~5 GB, once) and start the server.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 if [ ! -f model/config.json ]; then
-  echo ">> Downloading the model (about 4 GB, one time only)..."
-  huggingface-cli download ikantkode/Qwen3.5-4B-AWQ-vd --local-dir ./model
+  echo ">> Downloading the model (about 5 GB, one time only)..."
+  huggingface-cli download ikantkode/Qwen3.5-4B-AWQ-vd-lmhead-int4 --local-dir ./model
 fi
 
 echo ">> Building/starting the server (first run takes a few minutes)..."

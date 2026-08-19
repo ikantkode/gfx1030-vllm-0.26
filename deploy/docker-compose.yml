@@ -1,11 +1,13 @@
-# Qwen3.5-4B-AWQ-vd serving on Radeon PRO V620 (gfx1030) — one command.
+# Qwen3.5-4B-AWQ-vd-lmhead-int4 serving on Radeon PRO V620 (gfx1030) — one command.
 #
 #   ./quickstart.sh          (downloads the model, then starts everything)
 #   — or manually —
-#   huggingface-cli download ikantkode/Qwen3.5-4B-AWQ-vd --local-dir ./model
+#   huggingface-cli download ikantkode/Qwen3.5-4B-AWQ-vd-lmhead-int4 --local-dir ./model
 #   docker compose up -d --build
 #
 # All settings below are load-bearing for speed or stability on this GPU.
+# v1.1.0 note: the Docker image is UNCHANGED from v1.0.0 — only the model path
+# (./model) changed. Do not rebuild the image for this release.
 
 services:
   vllm:
