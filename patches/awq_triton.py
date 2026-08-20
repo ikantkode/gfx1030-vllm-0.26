@@ -749,6 +749,17 @@ def awq_gemm_triton(
         # Gate = the wrapper's asserts, checked here to stay assert-free.
         if K % 16 == 0 and (K // 16) % 32 == 0 and group_size % 32 == 0:
             bn, bk, sp, w = {
+                # [gfx1030] Rung 15 (SHIPPED v1.1.0). Phase 4 (Rung 19) tried an
+                # SP=1 (no K-split) re-tune of the two big gate/up shapes based on
+                # a two-run synthetic config sweep (bench_p4_gemv.py), but the
+                # in-situ gate on the REAL -vd model (gate_r19.py) showed it was
+                # NOT a win: (18432,2560) (256,32,1,2) ran 200.6us vs 181.3us at
+                # the shipped (128,32,4,4) -- SLOWER. The synthetic sweep's
+                # absolute scale is ~4.7x off the in-situ value and, in-situ,
+                # every decode GEMV shape is latency-floor-bound (~180-200us
+                # regardless of config), so config choice is a wash and the
+                # micro-bench deltas were noise. Reverted to rung-15 configs.
+                # See PROGRESS.md Entry 47.
                 (18432, 2560): (128, 32, 4, 4),
                 (12288, 2560): (128, 32, 4, 4),
                 (10240, 2560): (128, 32, 4, 4),
